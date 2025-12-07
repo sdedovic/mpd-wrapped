@@ -1,0 +1,7 @@
+# dev
+.envrc
+.direnv/
+.idea/
+
+# rust
+target/
