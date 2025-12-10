@@ -32,9 +32,17 @@
             pkg-config
             openssl
             sqlite
+            mpd
           ];
 
-          RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+          shellHook = ''
+            mkdir -p ~/.rust-rover/toolchain
+
+            ln -sfn ${rustToolchain}/lib ~/.rust-rover/toolchain
+            ln -sfn ${rustToolchain}/bin ~/.rust-rover/toolchain
+
+            export RUST_SRC_PATH="$HOME/.rust-rover/toolchain/lib/rustlib/src/rust/library";
+          '';
         };
       }
     );

@@ -1,154 +1,181 @@
-mod mpd;
-
-use mpd::MpdClient;
-use std::time::Instant;
+use anyhow::{anyhow, Context, Result};
+use mpd::{Client, Idle, Song, Subsystem};
+use std::net::ToSocketAddrs;
+use std::time::Duration;
 use tracing::info;
 
-struct ListenSession {
-    file_path: String,
-    artist: String,
-    title: String,
-    album: String,
-    duration_secs: u64,
-    started_at: Instant,
-    last_position_secs: u64,
-    accumulated_secs: u64,
+#[derive(Debug, Clone)]
+pub struct SongStatus {
+    pub song: Song,
+    pub duration: Duration,
+    pub elapsed: Duration,
 }
 
-impl ListenSession {
-    fn new(song: &::mpd::Song, current_position_secs: u64) -> Option<Self> {
-        let duration_secs = song.duration?.as_secs();
+struct MpdStatusIterator {
+    client: Client,
+}
 
-        Some(Self {
-            file_path: song.file.clone(),
-            artist: song
-                .tags
-                .iter()
-                .find(|(k, _)| k == "Artist")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| "Unknown".to_string()),
-            title: song.title.clone().unwrap_or_else(|| "Unknown".to_string()),
-            album: song
-                .tags
-                .iter()
-                .find(|(k, _)| k == "Album")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| "Unknown".to_string()),
-            duration_secs,
-            started_at: Instant::now(),
-            last_position_secs: current_position_secs,
-            accumulated_secs: current_position_secs,
+impl MpdStatusIterator {
+    pub fn new(host: &str, port: u16) -> Result<Self> {
+        let addr = format!("{}:{}", host, port)
+            .to_socket_addrs()
+            .context("Failed to resolve MPD address")?
+            .next()
+            .context("No address resolved")?;
+        match mpd::Client::connect(addr) {
+            Ok(client) => Result::Ok(MpdStatusIterator { client: client }),
+            Err(e) => Result::Err(anyhow!("Failed to connect to MPD: {e}")),
+        }
+    }
+}
+
+impl Iterator for MpdStatusIterator {
+    type Item = SongStatus;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.client.idle(&[Subsystem::Player]).ok()?;
+
+        let status = self.client.status().ok()?;
+        let elapsed = status.elapsed?;
+        let duration = status.duration?;
+
+        let song = self.client.currentsong().ok()??;
+
+        Some(SongStatus {
+            duration,
+            song,
+            elapsed,
         })
     }
+}
 
-    fn update_position(&mut self, current_position_secs: u64) {
-        // If position went backwards, song was probably seeked
-        if current_position_secs < self.last_position_secs {
-            println!(
-                "  [Seek detected: {}s -> {}s]",
-                self.last_position_secs, current_position_secs
-            );
-        } else {
-            let delta = current_position_secs - self.last_position_secs;
-            self.accumulated_secs += delta;
+#[derive(Debug, Clone)]
+pub struct SongListenRecord {
+    pub song: Song,
+    pub start: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentListen {
+    song: Song,
+    start: chrono::DateTime<chrono::Utc>,
+    max_elapsed: Duration,
+}
+
+struct SongListenTracker<I> {
+    inner: I,
+    current_listen: Option<CurrentListen>,
+}
+
+impl<I> SongListenTracker<I>
+where
+    I: Iterator<Item = SongStatus>,
+{
+    pub fn new(inner: I) -> Self {
+        Self {
+            inner,
+            current_listen: None,
         }
-        self.last_position_secs = current_position_secs;
     }
 
-    fn qualifies_as_listen(&self) -> bool {
-        // Minimum 30 seconds long
-        if self.duration_secs < 30 {
-            return false;
-        }
+    fn should_emit(max_elapsed: Duration, total_duration: Duration) -> bool {
+        let threshold_time = Duration::from_secs(20);
+        let threshold_percentage = 0.6;
 
-        let percent_played = self.accumulated_secs as f64 / self.duration_secs as f64;
+        let time_threshold_met = max_elapsed >= threshold_time;
+        let percentage_threshold_met = total_duration.as_secs() > 0
+            && max_elapsed.as_secs_f64() / total_duration.as_secs_f64() >= threshold_percentage;
 
-        // Scrobble if: played > 50% OR played > 4 minutes
-        percent_played >= 0.5 || self.accumulated_secs >= 240
+        time_threshold_met || percentage_threshold_met
     }
 
-    fn print_summary(&self) {
-        let percent = (self.accumulated_secs as f64 / self.duration_secs as f64) * 100.0;
-        let qualifies = if self.qualifies_as_listen() {
-            "✓ COUNTED"
-        } else {
-            "✗ SKIPPED"
-        };
+    fn is_restart(elapsed: Duration, max_elapsed: Duration) -> bool {
+        let restart_threshold = Duration::from_secs(5);
+        elapsed < restart_threshold && max_elapsed >= restart_threshold
+    }
+}
 
-        println!("\n{} {} - {}", qualifies, self.artist, self.title);
-        println!("  Album: {}", self.album);
-        println!(
-            "  Played: {}s / {}s ({:.1}%)",
-            self.accumulated_secs, self.duration_secs, percent
-        );
+impl<I> Iterator for SongListenTracker<I>
+where
+    I: Iterator<Item = SongStatus>,
+{
+    type Item = SongListenRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let status = self.inner.next()?;
+
+            match self.current_listen.take() {
+                None => {
+                    // First song
+                    self.current_listen = Some(CurrentListen {
+                        song: status.song,
+                        start: chrono::Utc::now(),
+                        max_elapsed: status.elapsed,
+                    });
+                }
+                Some(listen) if listen.song.file != status.song.file => {
+                    // Different song - check if we should emit the previous listen
+                    let should_emit = Self::should_emit(listen.max_elapsed, status.duration);
+
+                    // Start tracking new song
+                    self.current_listen = Some(CurrentListen {
+                        song: status.song,
+                        start: chrono::Utc::now(),
+                        max_elapsed: status.elapsed,
+                    });
+
+                    if should_emit {
+                        return Some(SongListenRecord {
+                            song: listen.song,
+                            start: listen.start,
+                        });
+                    }
+                }
+                Some(mut listen) => {
+                    // Same song
+                    if Self::is_restart(status.elapsed, listen.max_elapsed) {
+                        // Jumped back to start - emit if threshold met
+                        let should_emit = Self::should_emit(listen.max_elapsed, status.duration);
+
+                        // Start new listen of same song
+                        self.current_listen = Some(CurrentListen {
+                            song: listen.song.clone(),
+                            start: chrono::Utc::now(),
+                            max_elapsed: status.elapsed,
+                        });
+
+                        if should_emit {
+                            return Some(SongListenRecord {
+                                song: listen.song,
+                                start: listen.start,
+                            });
+                        }
+                    } else {
+                        // Update max_elapsed if progressing forward
+                        if status.elapsed > listen.max_elapsed {
+                            listen.max_elapsed = status.elapsed;
+                        }
+                        self.current_listen = Some(listen);
+                    }
+                }
+            }
+        }
     }
 }
 
 fn main() {
+    tracing_subscriber::fmt::init();
+
     println!("Connecting to MPD...");
+    let client = MpdStatusIterator::new("127.0.0.1", 6600).unwrap();
+    let tracker = SongListenTracker::new(client);
 
-    let mut client = MpdClient::new("127.0.0.1".to_string(), 6600);
-    client.connect().expect("Failed to connect to MPD");
-
-    println!("Connected! Monitoring playback...\n");
-
-    let mut current_session: Option<ListenSession> = None;
-
-    loop {
-        // // Poll every 5 seconds to track position
-        // std::thread::sleep(std::time::Duration::from_secs(5));
-        client.wait_for_changes().ok();
-
-        let status = match client.status() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        println!("{status:#?}")
-
-        // let current_song = client.current_song().ok().flatten();
-        //
-        // match status.state {
-        //     ::mpd::State::Play => {
-        //         if let Some(song) = current_song {
-        //             let current_pos = status.elapsed.map(|d| d.as_secs()).unwrap_or(0);
-        //
-        //             match &mut current_session {
-        //                 Some(session) if session.file_path == song.file => {
-        //                     // Same song, update position
-        //                     session.update_position(current_pos);
-        //                 }
-        //                 _ => {
-        //                     // New song - finalize old session with its last known position
-        //                     if let Some(session) = current_session.take() {
-        //                         session.print_summary();
-        //                     }
-        //
-        //                     if let Some(new_session) = ListenSession::new(&song, current_pos) {
-        //                         println!(
-        //                             "\n▶ Started: {} - {}",
-        //                             new_session.artist, new_session.title
-        //                         );
-        //                         current_session = Some(new_session);
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //     }
-        //     ::mpd::State::Pause => {
-        //         // Update position when paused
-        //         if let Some(session) = &mut current_session {
-        //             if let Some(elapsed) = status.elapsed {
-        //                 session.update_position(elapsed.as_secs());
-        //             }
-        //         }
-        //     }
-        //     ::mpd::State::Stop => {
-        //         // Finalize session when stopped
-        //         if let Some(session) = current_session.take() {
-        //             session.print_summary();
-        //         }
-        //     }
-        // }
+    for record in tracker {
+        info!(
+            "Song listened: {:?} (started at {})",
+            record.song.title.as_deref().unwrap_or("Unknown"),
+            record.start
+        );
     }
 }

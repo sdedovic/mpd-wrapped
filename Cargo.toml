@@ -7,9 +7,6 @@ edition = "2021"
 # MPD client
 mpd = "0.1"
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
 # Date/time
 chrono = "0.4"
 
