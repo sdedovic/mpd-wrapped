@@ -1,3 +1,3 @@
 pub mod sqlite;
 
-pub use sqlite::{MusicDb, PlayRecord};
+pub use sqlite::MusicDb;

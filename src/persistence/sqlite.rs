@@ -1,5 +1,8 @@
+use crate::mpd::SongListenRecord;
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PlayRecord {
@@ -9,10 +12,44 @@ pub struct PlayRecord {
     pub album: Option<String>,
     pub album_artist: Option<String>,
     pub date: Option<String>,
-    pub original_date: Option<String>,
-    pub composer: Option<String>,
-    pub genres: Vec<String>,
-    pub performers: Vec<String>,
+    pub other_tags: HashMap<String, Vec<String>>,
+}
+
+impl From<SongListenRecord> for PlayRecord {
+    fn from(record: SongListenRecord) -> Self {
+        let mut tags_map: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (key, value) in record.song.tags {
+            tags_map.entry(key).or_default().push(value);
+        }
+
+        // don't really see a reason to track these
+        tags_map.remove("duration");
+        tags_map.remove("Added");
+        tags_map.remove("Format");
+        tags_map.remove("Track");
+        tags_map.remove("Disc");
+
+        // also remove all keys that are sorting variants, e.g. "AlbumArtistSort"
+        tags_map.retain(|key, _value| !key.ends_with("Sort"));
+
+        // pull top-level concepts out
+        let tag_title = tags_map.remove("Title").and_then(|mut v| v.pop());
+        let tag_artist = tags_map.remove("Artist").and_then(|mut v| v.pop());
+        let album = tags_map.remove("Album").and_then(|mut v| v.pop());
+        let album_artist = tags_map.remove("AlbumArtist").and_then(|mut v| v.pop());
+        let date = tags_map.remove("Date").and_then(|mut v| v.pop());
+
+        PlayRecord {
+            timestamp: record.start.timestamp(),
+            title: record.song.title.or(tag_title),
+            artist: record.song.artist.or(tag_artist),
+            album,
+            album_artist,
+            date,
+            other_tags: tags_map,
+        }
+    }
 }
 
 pub struct MusicDb {
@@ -21,7 +58,7 @@ pub struct MusicDb {
 
 impl MusicDb {
     /// Create a new database connection and initialize schema
-    pub fn new(db_path: &str) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let conn = Connection::open(db_path)?;
 
         conn.execute(
@@ -32,29 +69,17 @@ impl MusicDb {
                 artist TEXT,
                 album TEXT,
                 album_artist TEXT,
-                date TEXT,
-                original_date TEXT,
-                composer TEXT
+                date TEXT
             )",
             [],
         )?;
 
-        // Table for genres (many-to-many relationship)
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS play_genres (
-                play_id INTEGER NOT NULL,
-                genre TEXT NOT NULL,
-                FOREIGN KEY (play_id) REFERENCES plays(id) ON DELETE CASCADE
-            )",
-            [],
-        )?;
-
-        // Table for performers (many-to-many relationship)
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS play_performers (
-                play_id INTEGER NOT NULL,
-                performer TEXT NOT NULL,
-                FOREIGN KEY (play_id) REFERENCES plays(id) ON DELETE CASCADE
+            "CREATE TABLE IF NOT EXISTS plays_other_tags (
+                play_id  INTEGER NOT NULL,
+                tag_name TEXT NOT NULL,
+                tag_value TEXT NOT NULL,
+                FOREIGN KEY(play_id) REFERENCES plays(id) ON DELETE CASCADE
             )",
             [],
         )?;
@@ -76,12 +101,7 @@ impl MusicDb {
         )?;
 
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_play_genres_play_id ON play_genres(play_id)",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_play_performers_play_id ON play_performers(play_id)",
+            "CREATE INDEX IF NOT EXISTS idx_plays_album_artist ON plays(album_artist)",
             [],
         )?;
 
@@ -90,10 +110,9 @@ impl MusicDb {
 
     /// Log a play record
     pub fn log_play(&self, record: &PlayRecord) -> Result<i64> {
-        // Insert the main play record
         self.conn.execute(
-            "INSERT INTO plays (timestamp, title, artist, album, album_artist, date, original_date, composer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO plays (timestamp, title, artist, album, album_artist, date)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 record.timestamp,
                 record.title,
@@ -101,27 +120,17 @@ impl MusicDb {
                 record.album,
                 record.album_artist,
                 record.date,
-                record.original_date,
-                record.composer,
             ],
         )?;
-
         let play_id = self.conn.last_insert_rowid();
 
-        // Insert genres
-        for genre in &record.genres {
-            self.conn.execute(
-                "INSERT INTO play_genres (play_id, genre) VALUES (?1, ?2)",
-                params![play_id, genre],
-            )?;
-        }
-
-        // Insert performers
-        for performer in &record.performers {
-            self.conn.execute(
-                "INSERT INTO play_performers (play_id, performer) VALUES (?1, ?2)",
-                params![play_id, performer],
-            )?;
+        for (tag_name, tag_values) in &record.other_tags {
+            for tag_value in tag_values {
+                self.conn.execute(
+                    "INSERT INTO plays_other_tags (play_id, tag_name, tag_value) values (?1, ?2, ?3)",
+                    params![play_id, tag_name, tag_value],
+                )?;
+            }
         }
 
         Ok(play_id)
@@ -164,109 +173,6 @@ impl MusicDb {
 
         Ok(albums)
     }
-
-    /// Get top genres by play count
-    pub fn top_genres(&self, limit: usize) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT genre, COUNT(*) as play_count
-             FROM play_genres
-             GROUP BY genre
-             ORDER BY play_count DESC
-             LIMIT ?1",
-        )?;
-
-        let genres = stmt
-            .query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(genres)
-    }
-
-    /// Get play count for a date range
-    pub fn plays_in_range(&self, start_ts: i64, end_ts: i64) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM plays WHERE timestamp >= ?1 AND timestamp <= ?2",
-            params![start_ts, end_ts],
-            |row| row.get(0),
-        )?;
-
-        Ok(count)
-    }
-
-    /// Get all plays with full details (including genres and performers)
-    pub fn get_plays(&self, limit: Option<usize>) -> Result<Vec<PlayRecord>> {
-        let query = if let Some(lim) = limit {
-            format!(
-                "SELECT id, timestamp, title, artist, album, album_artist, date, original_date, composer
-                 FROM plays
-                 ORDER BY timestamp DESC
-                 LIMIT {}",
-                lim
-            )
-        } else {
-            "SELECT id, timestamp, title, artist, album, album_artist, date, original_date, composer
-             FROM plays
-             ORDER BY timestamp DESC"
-                .to_string()
-        };
-
-        let mut stmt = self.conn.prepare(&query)?;
-        let rows = stmt.query_map([], |row| {
-            let play_id: i64 = row.get(0)?;
-
-            Ok((
-                play_id,
-                PlayRecord {
-                    timestamp: row.get(1)?,
-                    title: row.get(2)?,
-                    artist: row.get(3)?,
-                    album: row.get(4)?,
-                    album_artist: row.get(5)?,
-                    date: row.get(6)?,
-                    original_date: row.get(7)?,
-                    composer: row.get(8)?,
-                    genres: Vec::new(),     // Filled below
-                    performers: Vec::new(), // Filled below
-                },
-            ))
-        })?;
-
-        let mut plays = Vec::new();
-        for row_result in rows {
-            let (play_id, mut play) = row_result?;
-
-            // Fetch genres for this play
-            let mut genre_stmt = self
-                .conn
-                .prepare("SELECT genre FROM play_genres WHERE play_id = ?1")?;
-            let genres: Vec<String> = genre_stmt
-                .query_map(params![play_id], |row| row.get(0))?
-                .collect::<Result<Vec<_>>>()?;
-            play.genres = genres;
-
-            // Fetch performers for this play
-            let mut performer_stmt = self
-                .conn
-                .prepare("SELECT performer FROM play_performers WHERE play_id = ?1")?;
-            let performers: Vec<String> = performer_stmt
-                .query_map(params![play_id], |row| row.get(0))?
-                .collect::<Result<Vec<_>>>()?;
-            play.performers = performers;
-
-            plays.push(play);
-        }
-
-        Ok(plays)
-    }
-
-    /// Get total play count
-    pub fn total_plays(&self) -> Result<i64> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM plays", [], |row| row.get(0))?;
-
-        Ok(count)
-    }
 }
 
 #[cfg(test)]
@@ -284,25 +190,16 @@ mod tests {
             album: Some("Test Album".to_string()),
             album_artist: Some("Test Artist".to_string()),
             date: Some("2023".to_string()),
-            original_date: None,
-            composer: Some("Test Composer".to_string()),
-            genres: vec!["Rock".to_string(), "Alternative".to_string()],
-            performers: vec!["Performer 1".to_string(), "Performer 2".to_string()],
+            other_tags: Default::default(),
         };
 
         let play_id = db.log_play(&record)?;
         assert!(play_id > 0);
 
-        let total = db.total_plays()?;
-        assert_eq!(total, 1);
-
         let top_artists = db.top_artists(10)?;
         assert_eq!(top_artists.len(), 1);
         assert_eq!(top_artists[0].0, "Test Artist");
         assert_eq!(top_artists[0].1, 1);
-
-        let top_genres = db.top_genres(10)?;
-        assert_eq!(top_genres.len(), 2);
 
         Ok(())
     }
@@ -319,16 +216,10 @@ mod tests {
                 album: Some("Same Album".to_string()),
                 album_artist: Some("Same Artist".to_string()),
                 date: Some("2023".to_string()),
-                original_date: None,
-                composer: None,
-                genres: vec!["Rock".to_string()],
-                performers: vec![],
+                other_tags: Default::default(),
             };
             db.log_play(&record)?;
         }
-
-        let total = db.total_plays()?;
-        assert_eq!(total, 5);
 
         let top_artists = db.top_artists(10)?;
         assert_eq!(top_artists[0].1, 5);
