@@ -1,8 +1,15 @@
 use anyhow::{anyhow, Context, Result};
+use directories::ProjectDirs;
 use mpd::{Client, Idle, Song, Subsystem};
+use std::fs;
 use std::net::ToSocketAddrs;
+use std::path::PathBuf;
 use std::time::Duration;
-use tracing::info;
+use tracing::{debug, field::debug, info};
+
+mod persistence;
+
+use persistence::MusicDb;
 
 #[derive(Debug, Clone)]
 pub struct SongStatus {
@@ -164,8 +171,41 @@ where
     }
 }
 
-fn main() {
+pub fn get_db_path() -> Result<PathBuf> {
+    let proj_dirs = ProjectDirs::from("", "", "mpd-wrapped")
+        .context("Could not determine project directories")?;
+
+    // Get data directory (for the database)
+    let data_dir = proj_dirs.data_dir();
+    fs::create_dir_all(data_dir).context("Failed to create data directory")?;
+
+    Ok(data_dir.join("music.db"))
+}
+
+pub fn get_config_path() -> Result<PathBuf> {
+    let proj_dirs = ProjectDirs::from("", "", "mpd-wrapped")
+        .context("Could not determine project directories")?;
+
+    // Get config directory
+    let config_dir = proj_dirs.config_dir();
+    fs::create_dir_all(config_dir).context("Failed to create config directory")?;
+
+    Ok(config_dir.join("config.toml"))
+}
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
+
+    let mut db: MusicDb;
+
+    let db_path = get_db_path()?;
+    let db_path_str = db_path.as_os_str();
+    if db_path.exists() {
+        info!("found existing db at {db_path_str:?}");
+    } else {
+        info!("no existing database found, creating one at {db_path_str:?}");
+        db = MusicDb::new(db_path.as_path());
+    }
 
     println!("Connecting to MPD...");
     let client = MpdStatusIterator::new("127.0.0.1", 6600).unwrap();
@@ -178,4 +218,6 @@ fn main() {
             record.start
         );
     }
+
+    Ok(())
 }
