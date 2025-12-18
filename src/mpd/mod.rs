@@ -1,3 +1,5 @@
-pub mod client;
+mod listen_iterator;
+mod status_iterator;
 
-pub use client::MpdClient;
+pub use listen_iterator::{ListenIterator, SongListenRecord};
+pub use status_iterator::StatusIterator;
