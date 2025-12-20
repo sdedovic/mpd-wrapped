@@ -1,8 +1,11 @@
 use crate::mpd::SongListenRecord;
+use include_dir::{include_dir, Dir};
 use rusqlite::{params, Connection, Result};
+use rusqlite_migration::Migrations;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PlayRecord {
@@ -13,6 +16,7 @@ pub struct PlayRecord {
     pub album_artist: Option<String>,
     pub date: Option<String>,
     pub other_tags: HashMap<String, Vec<String>>,
+    pub song_duration_seconds: Option<u64>,
 }
 
 impl From<SongListenRecord> for PlayRecord {
@@ -39,6 +43,7 @@ impl From<SongListenRecord> for PlayRecord {
         let album = tags_map.remove("Album").and_then(|mut v| v.pop());
         let album_artist = tags_map.remove("AlbumArtist").and_then(|mut v| v.pop());
         let date = tags_map.remove("Date").and_then(|mut v| v.pop());
+        let song_duration_seconds = record.song.duration.map(|d| d.as_secs());
 
         PlayRecord {
             timestamp: record.start.timestamp(),
@@ -48,6 +53,7 @@ impl From<SongListenRecord> for PlayRecord {
             album_artist,
             date,
             other_tags: tags_map,
+            song_duration_seconds,
         }
     }
 }
@@ -56,54 +62,16 @@ pub struct MusicDb {
     conn: Connection,
 }
 
+static MIGRATIONS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/migrations");
+static MIGRATIONS: LazyLock<Migrations<'static>> =
+    LazyLock::new(|| Migrations::from_directory(&MIGRATIONS_DIR).unwrap());
+
 impl MusicDb {
     /// Create a new database connection and initialize schema
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
+        let mut conn = Connection::open(db_path)?;
 
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS plays (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER NOT NULL,
-                title TEXT,
-                artist TEXT,
-                album TEXT,
-                album_artist TEXT,
-                date TEXT
-            )",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS plays_other_tags (
-                play_id  INTEGER NOT NULL,
-                tag_name TEXT NOT NULL,
-                tag_value TEXT NOT NULL,
-                FOREIGN KEY(play_id) REFERENCES plays(id) ON DELETE CASCADE
-            )",
-            [],
-        )?;
-
-        // Indexes for better query performance
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_plays_timestamp ON plays(timestamp)",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_plays_artist ON plays(artist)",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_plays_album ON plays(album)",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_plays_album_artist ON plays(album_artist)",
-            [],
-        )?;
+        MIGRATIONS.to_latest(&mut conn).unwrap();
 
         Ok(MusicDb { conn })
     }
@@ -111,8 +79,8 @@ impl MusicDb {
     /// Log a play record
     pub fn log_play(&self, record: &PlayRecord) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO plays (timestamp, title, artist, album, album_artist, date)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO plays (timestamp, title, artist, album, album_artist, date, song_duration_seconds)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 record.timestamp,
                 record.title,
@@ -120,6 +88,7 @@ impl MusicDb {
                 record.album,
                 record.album_artist,
                 record.date,
+                record.song_duration_seconds
             ],
         )?;
         let play_id = self.conn.last_insert_rowid();
@@ -191,6 +160,7 @@ mod tests {
             album_artist: Some("Test Artist".to_string()),
             date: Some("2023".to_string()),
             other_tags: Default::default(),
+            song_duration_seconds: None,
         };
 
         let play_id = db.log_play(&record)?;
@@ -217,6 +187,7 @@ mod tests {
                 album_artist: Some("Same Artist".to_string()),
                 date: Some("2023".to_string()),
                 other_tags: Default::default(),
+                song_duration_seconds: None,
             };
             db.log_play(&record)?;
         }
