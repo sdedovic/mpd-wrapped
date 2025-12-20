@@ -56,6 +56,7 @@ fn main() -> Result<()> {
         for listen in listen_iter {
             db.log_play(&listen.into())?;
         }
+        info!("Disconnected from MPD")
     }
 
     Ok(())

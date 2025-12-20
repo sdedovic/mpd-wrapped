@@ -252,7 +252,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mpd-tracker"
+name = "mpd-wrapped"
 version = "0.1.0"
 dependencies = [
  "anyhow",
