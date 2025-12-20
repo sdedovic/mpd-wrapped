@@ -2,7 +2,6 @@ use anyhow::{anyhow, Context, Result};
 use mpd::{Client, Idle, Song, Subsystem};
 use std::net::ToSocketAddrs;
 use std::time::Duration;
-use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct SongStatus {
