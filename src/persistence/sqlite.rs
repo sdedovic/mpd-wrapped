@@ -19,6 +19,48 @@ pub struct PlayRecord {
     pub song_duration_seconds: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum TimeInterval {
+    Week,
+    Month,
+    Year,
+    AllTime,
+}
+
+impl TimeInterval {
+    fn to_seconds(&self) -> Option<i64> {
+        match self {
+            TimeInterval::Week => Some(7 * 24 * 60 * 60),
+            TimeInterval::Month => Some(30 * 24 * 60 * 60),
+            TimeInterval::Year => Some(365 * 24 * 60 * 60),
+            TimeInterval::AllTime => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ArtistStats {
+    pub artist_name: String,
+    pub play_count: i64,
+    pub total_minutes: f64,
+}
+
+#[derive(Debug)]
+pub struct SongStats {
+    pub title: String,
+    pub artist_name: String,
+    pub play_count: i64,
+    pub total_minutes: f64,
+}
+
+#[derive(Debug)]
+pub struct AlbumStats {
+    pub album: String,
+    pub artist_name: String,
+    pub play_count: i64,
+    pub total_minutes: f64,
+}
+
 impl From<SongListenRecord> for PlayRecord {
     fn from(record: SongListenRecord) -> Self {
         let mut tags_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -138,6 +180,140 @@ impl MusicDb {
             .query_map(params![limit], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(albums)
+    }
+
+    fn get_cutoff_timestamp(&self, interval: TimeInterval) -> Option<i64> {
+        interval.to_seconds().map(|seconds| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - seconds
+        })
+    }
+
+    pub fn get_top_artists(&self, interval: TimeInterval) -> Result<Vec<ArtistStats>> {
+        let cutoff = self.get_cutoff_timestamp(interval);
+
+        let query = if let Some(cutoff_ts) = cutoff {
+            format!(
+                "SELECT
+                    COALESCE(album_artist, artist) AS artist_name,
+                    COUNT(*) AS play_count,
+                    ROUND(SUM(song_duration_seconds) / 60.0, 2) AS total_minutes
+                FROM plays
+                WHERE timestamp >= {}
+                GROUP BY artist_name
+                ORDER BY total_minutes DESC",
+                cutoff_ts
+            )
+        } else {
+            "SELECT
+                COALESCE(album_artist, artist) AS artist_name,
+                COUNT(*) AS play_count,
+                ROUND(SUM(song_duration_seconds) / 60.0, 2) AS total_minutes
+            FROM plays
+            GROUP BY artist_name
+            ORDER BY total_minutes DESC".to_string()
+        };
+
+        let mut stmt = self.conn.prepare(&query)?;
+
+        let artists = stmt.query_map([], |row| {
+            Ok(ArtistStats {
+                artist_name: row.get(0)?,
+                play_count: row.get(1)?,
+                total_minutes: row.get(2)?,
+            })
+        })?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(artists)
+    }
+
+    pub fn get_top_songs(&self, interval: TimeInterval) -> Result<Vec<SongStats>> {
+        let cutoff = self.get_cutoff_timestamp(interval);
+
+        let query = if let Some(cutoff_ts) = cutoff {
+            format!(
+                "SELECT
+                    title,
+                    COALESCE(album_artist, artist) AS artist_name,
+                    COUNT(*) AS play_count,
+                    ROUND(SUM(song_duration_seconds) / 60.0, 2) AS total_minutes
+                FROM plays
+                WHERE timestamp >= {}
+                GROUP BY title, artist_name
+                ORDER BY total_minutes DESC",
+                cutoff_ts
+            )
+        } else {
+            "SELECT
+                title,
+                COALESCE(album_artist, artist) AS artist_name,
+                COUNT(*) AS play_count,
+                ROUND(SUM(song_duration_seconds) / 60.0, 2) AS total_minutes
+            FROM plays
+            GROUP BY title, artist_name
+            ORDER BY total_minutes DESC".to_string()
+        };
+
+        let mut stmt = self.conn.prepare(&query)?;
+
+        let songs = stmt.query_map([], |row| {
+            Ok(SongStats {
+                title: row.get(0)?,
+                artist_name: row.get(1)?,
+                play_count: row.get(2)?,
+                total_minutes: row.get(3)?,
+            })
+        })?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(songs)
+    }
+
+    pub fn get_top_albums(&self, interval: TimeInterval) -> Result<Vec<AlbumStats>> {
+        let cutoff = self.get_cutoff_timestamp(interval);
+
+        let query = if let Some(cutoff_ts) = cutoff {
+            format!(
+                "SELECT
+                    album,
+                    COALESCE(album_artist, artist) AS artist_name,
+                    COUNT(*) AS play_count,
+                    ROUND(SUM(song_duration_seconds) / 60.0, 2) AS total_minutes
+                FROM plays
+                WHERE album IS NOT NULL AND timestamp >= {}
+                GROUP BY album, artist_name
+                ORDER BY total_minutes DESC",
+                cutoff_ts
+            )
+        } else {
+            "SELECT
+                album,
+                COALESCE(album_artist, artist) AS artist_name,
+                COUNT(*) AS play_count,
+                ROUND(SUM(song_duration_seconds) / 60.0, 2) AS total_minutes
+            FROM plays
+            WHERE album IS NOT NULL
+            GROUP BY album, artist_name
+            ORDER BY total_minutes DESC".to_string()
+        };
+
+        let mut stmt = self.conn.prepare(&query)?;
+
+        let albums = stmt.query_map([], |row| {
+            Ok(AlbumStats {
+                album: row.get(0)?,
+                artist_name: row.get(1)?,
+                play_count: row.get(2)?,
+                total_minutes: row.get(3)?,
+            })
+        })?
             .collect::<Result<Vec<_>>>()?;
 
         Ok(albums)
